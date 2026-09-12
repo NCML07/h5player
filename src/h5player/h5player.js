@@ -37,6 +37,7 @@ import windowSandbox from './h5playerUISandbox'
 import version from './version'
 import remoteHelper from './remoteHelper'
 import { isCloudflareChallengePage } from './cfChallenge'
+import { createDouyinNativeMediaBridge, isDouyinWebPage } from './douyinNativeMediaBridge'
 
 import {
   isRegisterKey,
@@ -57,6 +58,12 @@ import h5playerUiWraper from './ui/h5playerUI.es'
 const supportMediaTags = ['video', 'bwp-video']
 
 let TCC = null
+const douyinNativeMediaBridge = createDouyinNativeMediaBridge({
+  configManager,
+  i18n,
+  isEditableTarget
+})
+
 const h5Player = {
   version,
   mediaCore,
@@ -714,6 +721,20 @@ const h5Player = {
       configManager.setGlobalStorage('media.playbackRate', curPlaybackRate)
     } else {
       configManager.set('media.playbackRate', curPlaybackRate)
+    }
+
+    /*
+     * Douyin's MediaStream player keeps the effective rate on player._core.
+     * Route both hotkey and feed-initialization updates through the same
+     * float32-safe control path so UI state and actual playback stay aligned.
+     */
+    if (isDouyinWebPage() && douyinNativeMediaBridge.enabled) {
+      const showRateTip = !notips && !(!num && curPlaybackRate === 1)
+      if (douyinNativeMediaBridge.setDesiredRate(curPlaybackRate, showRateTip)) {
+        t.playbackRateInfo.time = Date.now()
+        t.playbackRateInfo.value = curPlaybackRate
+        return true
+      }
     }
 
     if (t.mediaPlusApi) {
@@ -2681,6 +2702,14 @@ const h5Player = {
 
     /* 绑定键盘事件 */
     if (configManager.get('enableHotkeys') !== false) {
+      /* The window-capture bridge must run before the generic key handler. */
+      if (isDouyinWebPage()) {
+        try {
+          douyinNativeMediaBridge.init(t)
+        } catch (e) {
+          console.warn('[h5player][DouyinNativeFix] bridge init failed; using generic hotkeys', e)
+        }
+      }
       t.bindEvent()
       t.bindFakeEvent()
     } else {
@@ -2738,14 +2767,20 @@ async function h5PlayerInit () {
         debug.warn('[experimentFeatures][mediaSource][activated]')
       }
 
-      /* 禁止对playbackRate等属性进行锁定 */
-      hackDefineProperty()
+      /* Douyin's React player needs truthful native media properties. */
+      if (!isDouyinWebPage()) {
+        /* 禁止对playbackRate等属性进行锁定 */
+        hackDefineProperty()
+      }
 
       /* 禁止对shadowdom使用close模式 */
       hackAttachShadow()
 
-      /* 对所有事件进行接管 */
-      proxyHTMLMediaElementEvent()
+      /* Douyin uses its own state reconciliation; keep generic event AOP off. */
+      if (!isDouyinWebPage()) {
+        /* 对所有事件进行接管 */
+        proxyHTMLMediaElementEvent()
+      }
       // hackEventListener()
     }
   } catch (e) {
