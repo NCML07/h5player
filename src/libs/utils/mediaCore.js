@@ -1,4 +1,5 @@
 import original from './original'
+import { isDouyinWebPage } from '../../h5player/douyinNativeMediaBridge'
 
 /**
  * 媒体标签检测，可以检测出viode、audio、以及其它标签名经过改造后的媒体Element
@@ -252,7 +253,10 @@ const mediaCore = (function () {
       const proxyMethods = ['play', 'pause', 'load', 'addEventListener']
       proxyMethods.forEach(methodName => { proxyPrototypeMethod(HTMLMediaElement, methodName) })
 
-      const hijackProperty = ['playbackRate', 'volume', 'currentTime', 'src']
+      /* Douyin's React player reads these native properties for state sync. */
+      const hijackProperty = isDouyinWebPage()
+        ? ['src']
+        : ['playbackRate', 'volume', 'currentTime', 'src']
       hijackProperty.forEach(property => { hijackPrototypeProperty(HTMLMediaElement, property) })
 
       hasProxyHTMLMediaElement = true
