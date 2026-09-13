@@ -9,8 +9,9 @@
  *
  * The bridge is deliberately isolated to non-live douyin.com pages. It also
  * keeps native media getters truthful, selects the active virtualized feed
- * video, seeks through the React player API, and lazily guards confirmed
- * page-side 1x reconciliation for rates above 3x.
+ * video, seeks through the React player API, lazily guards confirmed page-side
+ * 1x reconciliation for rates above 3x, and primes newly-created MediaStream
+ * cores before PLAY so remembered rates take effect without a 1x startup gap.
  */
 
 export function isDouyinWebPage (win = window) {
@@ -73,9 +74,23 @@ export function createDouyinNativeMediaBridge ({ configManager, i18n, isEditable
   let seekGuardTarget = 0
   let seekGuardAt = 0
   let seekGuardUntil = 0
-  let enforceTimer = null
-  let mutationTimer = null
-  let observer = null
+
+  /*
+   * React to the actual media event target during feed activation, then retry
+   * only for a short bounded window while Douyin associates the video with its
+   * MediaStream Core. This replaces the always-on subtree observer and 400 ms
+   * polling used by the previous bridge.
+   */
+  let activationGeneration = 0
+  let activationTimers = []
+  let lastActivationVideo = null
+  let lastActivationReason = ''
+  let lastActivationAt = 0
+  let activationAttemptCount = 0
+  let mediaStreamActivationApplyCount = 0
+  let legacyActivationApplyCount = 0
+  let blockedLegacyRateResetCount = 0
+  const activationRetryDelays = [12, 30, 60, 100, 160, 240, 340, 480]
 
   /*
    * The core accessor guard is installed lazily only when h5player explicitly
@@ -93,7 +108,22 @@ export function createDouyinNativeMediaBridge ({ configManager, i18n, isEditable
   let rateRequestGeneration = 0
   let lastRateHotkeyAt = 0
   const rateHotkeyDebounceMs = 160
-  const bridgeVersion = 'douyin-mediastream-float32-v9'
+  const bridgeVersion = 'douyin-mediastream-preplay-numeric-v10.1'
+
+  /*
+   * The MediaStream Core is primed immediately before Douyin posts PLAY to its
+   * Worker. This removes the short 1x startup period on newly-created items.
+   * Keep a bounded diagnostics log for field verification.
+   */
+  const prePlayHookedOwners = new Map()
+  const prePlayPrimeLog = []
+  let prePlayScanTimer = null
+  let prePlayHookInstallCount = 0
+  let prePlayPrimeAttemptCount = 0
+  let prePlayPrimeSuccessCount = 0
+  let prePlayLiveSkipCount = 0
+  let prePlayLastRecord = null
+  let prePlayLastScanSignature = ''
 
   const activeSelectors = [
     '[data-e2e="feed-active-video"] video',
@@ -106,6 +136,16 @@ export function createDouyinNativeMediaBridge ({ configManager, i18n, isEditable
   function isVideoLike (value) {
     try {
       return Boolean(value && String(value.tagName || value.localName || '').toLowerCase() === 'video')
+    } catch (e) {
+      return false
+    }
+  }
+
+  function isMediaStreamLikeVideo (video) {
+    if (!isVideoLike(video)) return false
+    try {
+      const srcObject = video.srcObject
+      return Boolean(srcObject && String((srcObject.constructor && srcObject.constructor.name) || '') === 'MediaStream')
     } catch (e) {
       return false
     }
@@ -225,6 +265,234 @@ export function createDouyinNativeMediaBridge ({ configManager, i18n, isEditable
     } catch (e) {
       return null
     }
+  }
+
+  function prePlayNowRecord (extra) {
+    return Object.assign({
+      perf: performance.now(),
+      epoch: Date.now(),
+      iso: new Date().toISOString()
+    }, extra || {})
+  }
+
+  function pushPrePlayLog (record, toConsole) {
+    prePlayPrimeLog.push(record)
+    if (prePlayPrimeLog.length > 4000) {
+      prePlayPrimeLog.splice(0, prePlayPrimeLog.length - 4000)
+    }
+    prePlayLastRecord = record
+    if (toConsole) console.log('[h5player][DouyinPrePlayV10]', record)
+  }
+
+  function coreTypeOf (core) {
+    try {
+      return String((core && (core.coreType || core._coreType)) || '').toLowerCase()
+    } catch (e) {
+      return ''
+    }
+  }
+
+  function findCoreMethodOwner (core, methodName) {
+    let owner = core
+    let depth = 0
+    while (owner && depth < 20) {
+      try {
+        const descriptor = Object.getOwnPropertyDescriptor(owner, methodName)
+        if (descriptor && typeof descriptor.value === 'function') {
+          return { owner, descriptor, depth }
+        }
+        owner = Object.getPrototypeOf(owner)
+      } catch (e) {
+        owner = null
+      }
+      depth += 1
+    }
+    return null
+  }
+
+  function relatedCoreMethodNames (core) {
+    const result = []
+    let owner = core
+    let depth = 0
+    while (owner && depth < 8) {
+      let names = []
+      try { names = Object.getOwnPropertyNames(owner) } catch (e) {}
+      names.forEach(function (name) {
+        if (/play|worker|send|post|rate/i.test(name)) result.push(depth + ':' + name)
+      })
+      try { owner = Object.getPrototypeOf(owner) } catch (e) { owner = null }
+      depth += 1
+    }
+    return Array.from(new Set(result)).slice(0, 120)
+  }
+
+  function primeMediaStreamCoreBeforePlay (core, hookStrategy) {
+    const coreType = coreTypeOf(core)
+    let instanceId = null
+    let isLive = false
+    let beforePrivate = NaN
+    let beforeDefault = NaN
+    try { instanceId = (core && core._instanceId) || null } catch (e) {}
+    try { isLive = Boolean(core && core.isLive === true) } catch (e) {}
+    try { beforePrivate = Number(core && core._playbackRate) } catch (e) {}
+    try { beforeDefault = Number(core && core._defaultPlaybackRate) } catch (e) {}
+
+    const cleanDesired = Number(desiredRate)
+    let applied = null
+    let primed = false
+    let reason = ''
+
+    prePlayPrimeAttemptCount += 1
+
+    if (coreType !== 'mediastream') {
+      reason = 'not_mediastream'
+    } else if (isLive) {
+      prePlayLiveSkipCount += 1
+      reason = 'skip_live_core'
+    } else if (!rateGuardActive || !Number.isFinite(cleanDesired) || cleanDesired <= 0) {
+      reason = 'no_active_desired_rate'
+    } else {
+      /* Keep UI/state decimal-clean, but seed the exact Float32 value that the
+       * WebCodecs/WASM rate path will later report back to the Worker. */
+      applied = Math.fround(Math.min(16, Math.max(0.1, Number(cleanDesired.toFixed(1)))))
+      try {
+        core._playbackRate = applied
+        primed = Object.is(Number(core._playbackRate), applied)
+        reason = primed ? 'private_rate_primed_before_play' : 'private_write_not_confirmed'
+        if (primed) prePlayPrimeSuccessCount += 1
+      } catch (e) {
+        reason = 'private_write_error:' + String((e && e.message) || e)
+      }
+    }
+
+    const record = prePlayNowRecord({
+      type: 'before_send_play_to_worker',
+      hookStrategy,
+      desiredRate: Number.isFinite(cleanDesired) ? cleanDesired : null,
+      appliedRate: applied,
+      beforePrivateRate: Number.isFinite(beforePrivate) ? beforePrivate : null,
+      beforeDefaultRate: Number.isFinite(beforeDefault) ? beforeDefault : null,
+      afterPrivateRate: (function () {
+        try {
+          const value = Number(core && core._playbackRate)
+          return Number.isFinite(value) ? value : null
+        } catch (e) { return null }
+      })(),
+      coreType,
+      isLive,
+      instanceId,
+      primed,
+      reason
+    })
+    pushPrePlayLog(record, false)
+    return record
+  }
+
+  function installPrePlayOwnerHook (found, source) {
+    if (!found || !found.owner || !found.descriptor || typeof found.descriptor.value !== 'function') return false
+    if (prePlayHookedOwners.has(found.owner)) return true
+
+    const owner = found.owner
+    const descriptor = found.descriptor
+    const original = descriptor.value
+    const strategy = '_sendPlayToWorker@depth' + found.depth
+    const wrapped = function () {
+      primeMediaStreamCoreBeforePlay(this, strategy)
+      return original.apply(this, arguments)
+    }
+
+    try {
+      Object.defineProperty(owner, '_sendPlayToWorker', {
+        configurable: Boolean(descriptor.configurable),
+        enumerable: Boolean(descriptor.enumerable),
+        writable: Boolean(descriptor.writable),
+        value: wrapped
+      })
+    } catch (e) {
+      if (descriptor.writable) {
+        try { owner._sendPlayToWorker = wrapped } catch (e2) {}
+      }
+    }
+
+    let installed = false
+    try { installed = owner._sendPlayToWorker === wrapped } catch (e) {}
+    if (!installed) {
+      pushPrePlayLog(prePlayNowRecord({
+        type: 'hook_install_failed',
+        source,
+        depth: found.depth,
+        prototypeName: (function () {
+          try { return (owner.constructor && owner.constructor.name) || null } catch (e) { return null }
+        })(),
+        configurable: Boolean(descriptor.configurable),
+        writable: Boolean(descriptor.writable)
+      }), true)
+      return false
+    }
+
+    prePlayHookedOwners.set(owner, { original, descriptor, wrapped, depth: found.depth })
+    prePlayHookInstallCount += 1
+    pushPrePlayLog(prePlayNowRecord({
+      type: 'hook_installed',
+      source,
+      depth: found.depth,
+      prototypeName: (function () {
+        try { return (owner.constructor && owner.constructor.name) || null } catch (e) { return null }
+      })(),
+      hookedPrototypeCount: prePlayHookedOwners.size
+    }), true)
+    return true
+  }
+
+  function scanAndInstallPrePlayHook () {
+    const player = getPagePlayer()
+    let core = null
+    try { core = (player && player._core) || null } catch (e) {}
+    const coreType = coreTypeOf(core)
+    const found = core && coreType === 'mediastream' ? findCoreMethodOwner(core, '_sendPlayToWorker') : null
+
+    const signature = [Boolean(player), Boolean(core), coreType, Boolean(found), found && found.depth, prePlayHookedOwners.size].join('|')
+    if (signature !== prePlayLastScanSignature) {
+      prePlayLastScanSignature = signature
+      pushPrePlayLog(prePlayNowRecord({
+        type: 'install_scan',
+        source: 'integrated-v10',
+        hasPlayer: Boolean(player),
+        hasCore: Boolean(core),
+        coreType: coreType || null,
+        coreConstructor: (function () {
+          try { return (core && core.constructor && core.constructor.name) || null } catch (e) { return null }
+        })(),
+        hasSendPlayToWorker: Boolean(found),
+        methodDepth: found ? found.depth : null,
+        hookedPrototypeCount: prePlayHookedOwners.size,
+        relatedMethods: core && coreType === 'mediastream' && !found ? relatedCoreMethodNames(core) : undefined
+      }), false)
+    }
+
+    if (!core || coreType !== 'mediastream' || !found) return false
+    return installPrePlayOwnerHook(found, 'integrated-v10')
+  }
+
+  function exposeIntegratedPrePlayDiagnostics () {
+    try {
+      pageWin.__dyPreplayRatePrimeProbe = {
+        name: 'H5PLAYER_DOUYIN_INTEGRATED_PREPLAY_V10',
+        version: '10.1-integrated',
+        integratedIntoH5playerV10: true,
+        isInstalled: function () { return prePlayHookedOwners.size > 0 },
+        hookCount: function () { return prePlayHookedOwners.size },
+        tryInstall: scanAndInstallPrePlayHook,
+        getLog: function () { return prePlayPrimeLog.slice() },
+        getLastScan: function () {
+          for (let i = prePlayPrimeLog.length - 1; i >= 0; i--) {
+            if (prePlayPrimeLog[i] && prePlayPrimeLog[i].type === 'install_scan') return prePlayPrimeLog[i]
+          }
+          return null
+        },
+        clearLog: function () { prePlayPrimeLog.length = 0 }
+      }
+    } catch (e) {}
   }
 
   /**
@@ -438,8 +706,13 @@ export function createDouyinNativeMediaBridge ({ configManager, i18n, isEditable
     return video ? Number(nativeGet('currentTime', video)) : NaN
   }
 
-  function isProtectedVideo (video) {
+  function isProtectedLegacyVideo (video) {
     if (!rateGuardActive || desiredRate === null || !isVideoLike(video)) return false
+
+    /* MediaStream playback is controlled by player._core. Do not fight page
+     * writes on the DOM video element in that mode. */
+    if (isMediaStreamLikeVideo(video) || getMediaStreamContext(video)) return false
+
     const active = getActiveVideo()
     return active ? active === video : !video.paused
   }
@@ -447,8 +720,18 @@ export function createDouyinNativeMediaBridge ({ configManager, i18n, isEditable
   function setNativeRate (video, rate) {
     if (!video || !Number.isFinite(rate)) return false
     const normalized = Math.min(16, Math.max(0.1, Number(rate.toFixed(1))))
-    nativeSet('defaultPlaybackRate', video, normalized)
-    return nativeSet('playbackRate', video, normalized)
+    const currentDefault = Number(nativeGet('defaultPlaybackRate', video))
+    const currentRate = Number(nativeGet('playbackRate', video))
+    let ok = true
+
+    if (!Number.isFinite(currentDefault) || Math.abs(currentDefault - normalized) > 0.005) {
+      ok = nativeSet('defaultPlaybackRate', video, normalized) && ok
+    }
+    if (!Number.isFinite(currentRate) || Math.abs(currentRate - normalized) > 0.005) {
+      ok = nativeSet('playbackRate', video, normalized) && ok
+    }
+
+    return ok
   }
 
   function setMediaStreamRate (ctx, rate) {
@@ -467,6 +750,7 @@ export function createDouyinNativeMediaBridge ({ configManager, i18n, isEditable
   function setActiveRate (video, rate) {
     const ctx = getMediaStreamContext(video)
     if (ctx) return setMediaStreamRate(ctx, rate)
+    if (isMediaStreamLikeVideo(video)) return false
     return setNativeRate(video, rate)
   }
 
@@ -478,38 +762,95 @@ export function createDouyinNativeMediaBridge ({ configManager, i18n, isEditable
     } catch (e) {}
   }
 
-  function applyDesiredRateNow () {
-    if (desiredRate === null) return false
-    const video = getActiveVideo()
-    if (!video) return false
+  function applyDesiredRateToVideo (video) {
+    if (desiredRate === null || !video) return { ok: false, mode: 'none' }
 
-    const normalized = normalizeRateForActivePlayer(desiredRate)
-    if (!Number.isFinite(normalized)) return false
+    const normalized = normalizeRateForActivePlayer(desiredRate, video)
+    if (!Number.isFinite(normalized)) return { ok: false, mode: 'none' }
     if (normalized !== desiredRate) {
       desiredRate = normalized
       persistRate(normalized)
     }
 
     const mediaStreamCtx = getMediaStreamContext(video)
-    if (mediaStreamCtx && desiredRate > 3) {
-      ensureSuperRateGuard(mediaStreamCtx)
-    } else if (desiredRate <= 3) {
-      if (currentGuardedCore) releaseSuperRateGuard(currentGuardedCore)
-      if (mediaStreamCtx && guardedMediaStreamCores.has(mediaStreamCtx.core)) {
-        releaseSuperRateGuard(mediaStreamCtx.core)
+    if (mediaStreamCtx) {
+      if (desiredRate > 3) {
+        ensureSuperRateGuard(mediaStreamCtx)
+      } else {
+        if (currentGuardedCore && currentGuardedCore !== mediaStreamCtx.core) {
+          releaseSuperRateGuard(currentGuardedCore)
+        }
+        if (guardedMediaStreamCores.has(mediaStreamCtx.core)) {
+          releaseSuperRateGuard(mediaStreamCtx.core)
+        }
       }
+
+      const current = Number(mediaStreamCtx.core.playbackRate)
+      const applied = Math.fround(normalized)
+      if (!Number.isFinite(current) || Math.abs(current - applied) > 0.005) {
+        const ok = setMediaStreamRate(mediaStreamCtx, normalized)
+        if (ok) mediaStreamActivationApplyCount += 1
+        return { ok, mode: 'mediastream-core', applied: ok }
+      }
+      return { ok: true, mode: 'mediastream-core', applied: false }
     }
 
-    const current = getEffectivePlaybackRate(video)
-    if (!Number.isFinite(current) || Math.abs(current - desiredRate) > 0.005) {
-      setActiveRate(video, desiredRate)
+    if (isMediaStreamLikeVideo(video)) {
+      return { ok: false, mode: 'mediastream-pending', applied: false }
     }
+
+    if (currentGuardedCore) releaseSuperRateGuard(currentGuardedCore)
+
+    const current = Number(nativeGet('playbackRate', video))
+    if (!Number.isFinite(current) || Math.abs(current - normalized) > 0.005) {
+      const ok = setActiveRate(video, normalized)
+      if (ok) legacyActivationApplyCount += 1
+      return { ok, mode: 'legacy-media-element', applied: ok }
+    }
+    return { ok: true, mode: 'legacy-media-element', applied: false }
+  }
+
+  function cancelActivationBurst () {
+    activationTimers.forEach(function (timer) {
+      try { rawClearTimeout(timer) } catch (e) {}
+    })
+    activationTimers = []
+  }
+
+  function scheduleActivationBurst (video, reason) {
+    if (!rateGuardActive || desiredRate === null || !isVideoLike(video)) return false
+
+    cancelActivationBurst()
+    activationGeneration += 1
+    const generation = activationGeneration
+    lastActivationVideo = video
+    lastActivationReason = String(reason || 'media-event')
+    lastActivationAt = Date.now()
+
+    const run = function () {
+      if (generation !== activationGeneration || !rateGuardActive) return false
+      if (!video.isConnected) return false
+      activationAttemptCount += 1
+      return applyDesiredRateToVideo(video)
+    }
+
+    run()
+    activationRetryDelays.forEach(function (delay) {
+      const timer = rawSetTimeout(function () {
+        activationTimers = activationTimers.filter(function (item) { return item !== timer })
+        if (generation !== activationGeneration || !rateGuardActive) return
+        run()
+      }, delay)
+      activationTimers.push(timer)
+    })
     return true
   }
 
-  function enforceRateNow () {
-    if (!rateGuardActive || desiredRate === null) return false
-    return applyDesiredRateNow()
+  function applyDesiredRateNow () {
+    if (desiredRate === null) return false
+    const video = getActiveVideo()
+    if (!video) return false
+    return applyDesiredRateToVideo(video).ok
   }
 
   function cancelRateApplySchedule () {
@@ -540,15 +881,6 @@ export function createDouyinNativeMediaBridge ({ configManager, i18n, isEditable
     return commitDesiredRate(generation)
   }
 
-  function scheduleEnforce (delay) {
-    if (!rateGuardActive) return
-    if (enforceTimer) rawClearTimeout(enforceTimer)
-    enforceTimer = rawSetTimeout(function () {
-      enforceTimer = null
-      enforceRateNow()
-    }, Number(delay) || 0)
-  }
-
   /* Keep native getters truthful for Douyin's React state synchronization. */
   try {
     Object.defineProperty(mediaProto, 'playbackRate', {
@@ -562,9 +894,8 @@ export function createDouyinNativeMediaBridge ({ configManager, i18n, isEditable
         if (applyingDepth > 0) {
           return nativeDescriptor.playbackRate.set.call(this, value)
         }
-        if (isProtectedVideo(this) && Number.isFinite(rate) && Math.abs(rate - desiredRate) > 0.005) {
-          setNativeRate(this, desiredRate)
-          scheduleEnforce(0)
+        if (isProtectedLegacyVideo(this) && Number.isFinite(rate) && Math.abs(rate - desiredRate) > 0.005) {
+          blockedLegacyRateResetCount += 1
           return
         }
         return nativeDescriptor.playbackRate.set.call(this, value)
@@ -587,8 +918,8 @@ export function createDouyinNativeMediaBridge ({ configManager, i18n, isEditable
           if (applyingDepth > 0) {
             return nativeDescriptor.defaultPlaybackRate.set.call(this, value)
           }
-          if (isProtectedVideo(this) && Number.isFinite(rate) && Math.abs(rate - desiredRate) > 0.005) {
-            nativeSet('defaultPlaybackRate', this, desiredRate)
+          if (isProtectedLegacyVideo(this) && Number.isFinite(rate) && Math.abs(rate - desiredRate) > 0.005) {
+            blockedLegacyRateResetCount += 1
             return
           }
           return nativeDescriptor.defaultPlaybackRate.set.call(this, value)
@@ -626,7 +957,8 @@ export function createDouyinNativeMediaBridge ({ configManager, i18n, isEditable
     rate = Number(rate)
     if (!Number.isFinite(rate)) return false
 
-    rate = normalizeRateForActivePlayer(rate)
+    const video = getActiveVideo()
+    rate = normalizeRateForActivePlayer(rate, video)
     if (!Number.isFinite(rate)) return false
 
     desiredRate = rate
@@ -690,7 +1022,7 @@ export function createDouyinNativeMediaBridge ({ configManager, i18n, isEditable
 
     const rateBeforeSeek = getEffectivePlaybackRate(video)
     if (Number.isFinite(rateBeforeSeek) && rateBeforeSeek > 0) {
-      desiredRate = normalizeRateForActivePlayer(rateBeforeSeek)
+      desiredRate = normalizeRateForActivePlayer(rateBeforeSeek, video)
       rateGuardActive = Math.abs(desiredRate - 1) > 0.005
       persistRate(desiredRate)
     }
@@ -731,9 +1063,7 @@ export function createDouyinNativeMediaBridge ({ configManager, i18n, isEditable
     if (!seekSucceeded) return false
 
     if (rateGuardActive) {
-      scheduleEnforce(0)
-      rawSetTimeout(enforceRateNow, 80)
-      rawSetTimeout(enforceRateNow, 220)
+      scheduleActivationBurst(video, 'seek')
     }
 
     if (showTips && h5 && h5.tips) {
@@ -769,7 +1099,18 @@ export function createDouyinNativeMediaBridge ({ configManager, i18n, isEditable
     } else if (!event.ctrlKey && key === 'z') {
       handled = resetDesiredRate(true)
     } else if (!event.ctrlKey && (/^Digit[1-4]$/.test(code) || /^Numpad[1-4]$/.test(code))) {
-      handled = setDesiredRate(Number(code.slice(-1)), true)
+      const rate = Number(code.slice(-1))
+      /* Reuse h5player's original jump helper: a single press selects Nx,
+       * a rapid second press selects 2N x, and keyboard auto-repeat continues
+       * adding N until setPlaybackRate() clamps at 16x. setPlaybackRate() is
+       * already routed through this bridge on Douyin, so Float32-safe Core
+       * control and persistence remain intact. */
+      if (h5 && typeof h5.setPlaybackRatePlus === 'function') {
+        h5.setPlaybackRatePlus(rate)
+        handled = true
+      } else {
+        handled = setDesiredRate(rate, true)
+      }
     } else if (key === 'arrowright' || key === 'arrowleft') {
       const step = event.ctrlKey ? 30 : 5
       handled = seekBy(key === 'arrowright' ? step : -step, true)
@@ -798,36 +1139,39 @@ export function createDouyinNativeMediaBridge ({ configManager, i18n, isEditable
 
     window.addEventListener('keydown', handleKeydown, true)
 
+    exposeIntegratedPrePlayDiagnostics()
+    if (!prePlayScanTimer) {
+      prePlayScanTimer = rawSetInterval(scanAndInstallPrePlayHook, 20)
+      rawSetTimeout(scanAndInstallPrePlayHook, 0)
+    }
+
     const mediaEventHandler = function (event) {
       if (!rateGuardActive) return
       const target = event && event.target
-      if (isVideoLike(target) && isProtectedVideo(target)) {
-        scheduleEnforce(0)
-      } else {
-        scheduleEnforce(30)
+      if (!isVideoLike(target)) return
+
+      const eventType = String(event.type || '')
+      const directPlaybackEvent = eventType === 'play' || eventType === 'playing'
+      const visiblyRelevant = !target.paused || visibleScore(target, 0) > 0
+      if (directPlaybackEvent || visiblyRelevant) {
+        scheduleActivationBurst(target, eventType)
       }
     }
-    ;['play', 'playing', 'ratechange', 'loadedmetadata', 'durationchange', 'emptied'].forEach(function (eventName) {
+    ;['loadstart', 'loadedmetadata', 'canplay', 'play', 'playing', 'durationchange'].forEach(function (eventName) {
       document.addEventListener(eventName, mediaEventHandler, true)
     })
 
-    try {
-      if (document.documentElement) {
-        observer = new MutationObserver(function () {
-          if (!rateGuardActive) return
-          if (mutationTimer) rawClearTimeout(mutationTimer)
-          mutationTimer = rawSetTimeout(function () {
-            mutationTimer = null
-            enforceRateNow()
-          }, 80)
-        })
-        observer.observe(document.documentElement, { childList: true, subtree: true })
-      }
-    } catch (e) {}
+    document.addEventListener('visibilitychange', function () {
+      if (!rateGuardActive || document.hidden) return
+      const video = getActiveVideo()
+      if (video) scheduleActivationBurst(video, 'visibilitychange')
+    }, true)
 
     rawSetInterval(function () {
-      if (rateGuardActive && !document.hidden) enforceRateNow()
-    }, 400)
+      if (!rateGuardActive || document.hidden) return
+      const video = getActiveVideo()
+      if (video) applyDesiredRateToVideo(video)
+    }, 1500)
 
     try {
       pageWin.__h5DouyinNativeFix = {
@@ -837,13 +1181,20 @@ export function createDouyinNativeMediaBridge ({ configManager, i18n, isEditable
         seekBy: function (delta) { return seekBy(delta, false) },
         resetRate: function () { return resetDesiredRate(false) },
         getRate: function () { return getPlaybackRate() },
-        getTime: function () { return getCurrentTime() }
+        getTime: function () { return getCurrentTime() },
+        build: 'v10.1-preplay-numeric-jump-restored',
+        float32RateFix: true,
+        prePlayPrimeIntegrated: true,
+        eventTargetedActivation: true,
+        continuousMutationObserver: false
       }
     } catch (e) {}
 
     if (rateGuardActive) {
-      rawSetTimeout(enforceRateNow, 0)
-      rawSetTimeout(enforceRateNow, 200)
+      rawSetTimeout(function () {
+        const video = getActiveVideo()
+        if (video) scheduleActivationBurst(video, 'init')
+      }, 0)
     }
     return true
   }
@@ -871,9 +1222,29 @@ export function createDouyinNativeMediaBridge ({ configManager, i18n, isEditable
       pendingRateCommit: Boolean(rateApplyTimer),
       rateRequestGeneration,
       rateHotkeyDebounceMs,
+      activationGeneration,
+      activationPendingTimers: activationTimers.length,
+      lastActivationReason,
+      lastActivationAt,
+      lastActivationVideoIsActive: Boolean(video && lastActivationVideo === video),
+      activationAttemptCount,
+      mediaStreamActivationApplyCount,
+      legacyActivationApplyCount,
+      blockedLegacyRateResetCount,
+      activationStrategy: 'event-targeted-burst',
+      continuousMutationObserver: false,
+      fallbackIntervalMs: 1500,
       float32RateFix: true,
       delayedRateRetries: false,
       currentCoreGuarded: Boolean(mediaStreamCtx && currentGuardedCore === mediaStreamCtx.core),
+      prePlayPrimeIntegrated: true,
+      prePlayHookInstalled: prePlayHookedOwners.size > 0,
+      prePlayHookCount: prePlayHookedOwners.size,
+      prePlayHookInstallCount,
+      prePlayPrimeAttemptCount,
+      prePlayPrimeSuccessCount,
+      prePlayLiveSkipCount,
+      prePlayLastRecord,
       defaultPlaybackRate: video && nativeDescriptor.defaultPlaybackRate && nativeDescriptor.defaultPlaybackRate.get
         ? Number(nativeDescriptor.defaultPlaybackRate.get.call(video))
         : null,
