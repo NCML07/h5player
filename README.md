@@ -2,7 +2,7 @@
 
 ## 中文
 
-本仓库基于 [xxxily/h5player](https://github.com/xxxily/h5player) 修改，只加入了针对最新版抖音网页版播放器的兼容代码。
+本仓库基于 [xxxily/h5player](https://github.com/xxxily/h5player) 修改，只加入针对最新版抖音网页版播放器的兼容代码。
 
 ### 安装
 
@@ -14,7 +14,13 @@
 
 - 兼容抖音新版 React/WebCodecs MediaStream 播放器
 - 使用 Float32 安全倍速值，避免倍速队列卡住
-- 改进当前活动视频识别、进度跳转和高倍速防重置
+- 恢复数字键 1–4 的单击、双击和长按倍速累加功能
+- 改进新视频播放前的倍速预设、活动视频识别、进度跳转和高倍速防重置
+
+### 已知问题
+
+- 当前版本仍存在抖音旧模式视频播放卡顿的问题。
+- 倍速设置过高时，可能出现音画不同步的现象。
 
 ### 问题反馈
 
@@ -34,7 +40,13 @@ Install [Tampermonkey](https://www.tampermonkey.net/) or another userscript mana
 
 - Supports Douyin's latest React/WebCodecs MediaStream player
 - Uses Float32-safe playback-rate values to prevent rate-control queues from hanging
-- Improves active-video detection, seeking, and high-speed reset protection
+- Restores single-press, double-press, and long-press speed accumulation for number keys 1–4
+- Improves pre-play rate priming, active-video detection, seeking, and high-speed reset protection
+
+### Known issues
+
+- Videos using Douyin's legacy playback mode may still stutter.
+- Very high playback speeds may cause audio and video to become out of sync.
 
 ### Issues
 
